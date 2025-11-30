@@ -2,7 +2,7 @@
 #include <uapi/linux/pid_info.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
-#include <linut/sched/mm.h>
+#include <linux/sched/mm.h>
 #include <linux/errno.h>
 #include <linux/limits.h>
 #include <linux/slab.h>
@@ -12,6 +12,7 @@
 #include <linux/rwlock.h>
 #include <linux/sched/task.h>
 #include <linux/list.h>
+#include <asm-generic/rwonce.h>
 
 enum pid_state {
 	PID_STATE_RUNNING = 0, 
@@ -58,22 +59,23 @@ SYSCALL_DEFINE2(get_pid_info, struct pid_info __user *, up, int, pid)
 
     info->pid = pid;
 
-    if (tsk->exit_state & EXIT_TRACE)
+    if (READ_ONCE(tsk->exit_state) & EXIT_TRACE)
         info->state = PID_STATE_ZOMBIE;
-    else if (tsk->__state == TASK_RUNNING)
+    else if (READ_ONCE(tsk->__state) == TASK_RUNNING)
         info->state = PID_STATE_RUNNING;
     else
         info->state = PID_STATE_SLEEPING;
     
     mm = get_task_mm(tsk);
-    if (mm)
-        info->sp = mm->start_stack;
-    mmput(mm);
+    if (mm) {
+        info->sp = READ_ONCE(mm->start_stack);
+        mmput(mm);
+    }
 
     info->age = ktime_get_ns() - tsk->start_time;
 
     i = 0;
-    read_lock(&tasklist_lock)
+    read_lock(&tasklist_lock);
     list_for_each_entry(child, &tsk->children, sibling) {
         if (i == MAX_CHILDREN)
             break;
