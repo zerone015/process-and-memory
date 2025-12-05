@@ -48,7 +48,7 @@ static void print_pid_info(const struct pid_info *info, const char *title)
     printf("  state     : %s\n", pid_state_to_string(info->state));
     printf("  stack ptr : %p\n", (void *)info->sp);
     printf("  age       : %s\n", age_buf);
-    printf("  parent    : %d\n", info->parent);
+    printf("  ppid      : %d\n", info->parent);
     printf("  root      : %s\n",
            info->root[0] ? info->root : "(none)");
     printf("  pwd       : %s\n",
@@ -56,30 +56,29 @@ static void print_pid_info(const struct pid_info *info, const char *title)
     printf("\n");
 }
 
-static void print_parent_chain(int parent_pid)
+static void print_parent_chain(int ppid)
 {
     struct pid_info info;
-    int cur = parent_pid;
 
     printf("\n=== Parent chain ===\n\n");
 
-    if (parent_pid <= 0) {
+    if (ppid <= 0) {
         printf("(no parents)\n\n");
         return;
     }
 
-    while (cur > 0) {
-        if (get_pid_info(cur, &info) < 0) {
+    while (ppid > 0) {
+        if (get_pid_info(ppid, &info) < 0) {
             fprintf(stderr, "get_pid_info(%d) failed: %s\n",
-                    cur, strerror(errno));
+                    ppid, strerror(errno));
             exit(EXIT_FAILURE);
         }
 
         print_pid_info(&info, "Parent process");
 
-        if (info.parent <= 0 || info.parent == cur)
+        if (info.parent <= 0 || info.parent == ppid)
             break;
-        cur = info.parent;
+        ppid = info.parent;
     }
 
     printf("\n");
