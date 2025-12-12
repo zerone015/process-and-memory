@@ -1,5 +1,4 @@
-KDIR       := /usr/src/kernel-6.18.0
-
+KDIR       := /usr/src/linux-6.18.0
 KIMG       := $(KDIR)/arch/x86/boot/bzImage
 
 BOOTDIR    := /boot
@@ -12,7 +11,7 @@ PATCH       := patch.diff
 TEST_SRC := src/test.c
 TEST_BIN := test
 
-all: copy patch_kernel build install reboot
+all: reboot
 
 tester: $(TEST_BIN)
 
@@ -23,17 +22,17 @@ copy:
 	cp src/get_pid_info.c  $(KDIR)/kernel/get_pid_info.c
 	cp include/pid_info.h  $(KDIR)/include/uapi/linux/pid_info.h
 
-patch_kernel:
+patch_kernel: copy
 	git -C $(KDIR) apply $(PWD)/patch.diff || true
 
-build:
+build: patch_kernel
 	$(MAKE) -C $(KDIR)
 
-install:
+install: build
 	$(MAKE) -C $(KDIR) modules_install
 	cp $(KIMG)  $(TARGET_IMG)
 
-reboot:
+reboot: install
 	/sbin/reboot
 
 clean:
