@@ -121,6 +121,48 @@ __SYSCALL(470, sys_get_pid_info)
 
 ## sys_get_pid_info 구현
 
+### pid_info 구조체
+
+```c
+struct pid_info {
+    /* input */
+    int *children;
+    int cap_children;
+
+    /* output */
+    int nr_children;
+    int nr_reported;
+    int pid;
+    int state;
+    unsigned long sp;
+    __u64 age;
+    int parent;
+    char root[PATH_MAX];
+    char pwd[PATH_MAX];
+};
+```
+
+과제에서 요구하는 필드를 모두 포함하고, `children` 관련 필드가 추가 됩니다.  
+자식 PID 배열은 `root`, `pwd`와 달리 적절한 최대 길이를 정하기 어렵기 때문에   
+정적 배열로 두면 공간 낭비가 심하거나, 반대로 배열이 작아서 정보가 잘릴 수 있습니다.   
+따라서 유저 공간에서 `children`에 배열을 할당하고, `cap_children`에 그 배열의 크기를 넣어 넘기도록 합니다.
+
+커널은 유저가 넘긴 배열 크기 한도 내에서 자식 PID를 복사하고,   
+총 자식 수는 `nr_children`에, 실제로 복사한 개수는 `nr_reported`에 기록합니다.   
+유저는 `nr_children`과 `nr_reported` 값을 보고, 필요하다면 더 큰 버퍼를 새로 할당한 뒤 시스템 콜을 다시 호출할 수 있습니다. 
+`children`이 NULL인 경우, `nr_children`만 제공됩니다. 
+
+또한 이 구조체에 담기는 정보는 일관된 스냅샷을 보장하지 않습니다.   
+예를 들어 요청된 PID가 `do_exit()` 중인 유저 프로세스인 경우, `mm`, `fs`는 이미 해제되었지만    
+아직 `state`가 변경되지 않았을 수 있습니다.   
+이 경우 `sp`, `root`, `pwd`는 비어 있지만 `state`는 여전히 RUNNING으로 표시될 수 있습니다.
+
+이는 리눅스 커널이 각 필드를 하나의 락으로 통째로 동기화하지 않고,   
+필드별로 서로 다른 락과 메커니즘으로 보호하기 때문입니다.   
+동일한 정보들을 제공하는 `/proc`은 각 필드를 여러 파일로 나누어 보여 줍니다.   
+`pid_info`의 각 필드 역시 서로 다른 시점에 읽힌 개별 파일의 내용으로 보아야 합니다.
+
+### task_struct 조회
 프로세스의 정보는 대부분 `task_struct`에 들어 있습니다.  
 따라서 먼저 PID로 `task_struct`를 찾아와야 합니다.
 
@@ -139,13 +181,13 @@ reader 구간이 길어질수록 RCU writer나 콜백 처리 지연과 같은 �
 ### PID 채우기
 
 ```c
-static void fill_pid(struct pid_info *info, int pid)
+static void fill_pid(struct pid_info *info, struct task_struct *tsk)
 {
-    info->pid = pid;
+    info->pid = tsk->pid;
 }
 ```
 
-요청받은 PID 자체를 그대로 저장합니다.
+`task_struct`의 PID를 저장합니다.
 
 ### 상태 채우기
 
@@ -215,28 +257,77 @@ static void fill_age(struct pid_info *info, struct task_struct *tsk)
 ### 자식 리스트 채우기
 
 ```c
-static void fill_children(struct pid_info *info, struct task_struct *tsk)
+static int task_children_count(struct task_struct *tsk)
+{
+    int ret;
+
+    read_lock(&tasklist_lock);
+    ret = list_count_nodes(&tsk->children);
+    read_unlock(&tasklist_lock);
+    return ret;
+}
+
+static int copy_children(struct pid_info *info, struct task_struct *tsk, int n) 
 {
     struct task_struct *child;
+    int *buf;
     int i = 0;
+    int ret = 0;
+
+    buf = kvmalloc_array(n, sizeof(int), GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
 
     read_lock(&tasklist_lock);
     list_for_each_entry(child, &tsk->children, sibling) {
-        if (i == MAX_CHILDREN)
+        if (i == n)
             break;
-        info->children[i++] = child->pid;
+        buf[i++] = child->pid;
     }
     read_unlock(&tasklist_lock);
 
-    info->num_children = i;
+    if (copy_to_user(info->children, buf, i*sizeof(*buf))) {
+        ret = -EFAULT;
+        goto out;
+    }
+    info->nr_reported = i;
+
+out:
+    kvfree(buf);
+    return ret;
+}
+
+static int fill_children(struct pid_info *info, struct task_struct *tsk)
+{
+    int nr, cap_elems, n;
+
+    nr = task_children_count(tsk);
+	
+    info->nr_children = nr;
+
+    if (!nr)
+        return 0;
+    
+    if (!info->children)
+        return 0;
+    
+    cap_elems = info->cap_children / sizeof(int);
+    if (cap_elems <= 0)
+        return 0;
+    
+    n = min_t(int, nr, cap_elems);
+
+    return copy_children(info, tsk, n);
 }
 ```
 
 자식 프로세스 리스트(`tsk->children`)를 순회하려면 `tasklist_lock`을 잡아야 합니다.  
 락 없이 순회하면, 순회 도중 자식이 추가/삭제될 때 레이스가 발생할 수 있습니다.
 
-`MAX_CHILDREN`를 넘지 않는 선에서 PID를 배열에 채우고,  
-실제 채운 개수는 `num_children` 필드에 저장합니다.
+호출 사이에 자식 수가 변할 수 있기 때문에, 이전 요청에서 얻은 자식 수와 재호출 시점의 자식 수는 일치하지 않을 수 있습니다.   
+자식 수가 줄어든 경우에는 모든 자식을 복사할 수 있지만, 늘어난 경우에는 유저 버퍼 용량만큼만 잘려서 복사됩니다.   
+유저 공간에서는 `nr_children`과 `nr_reported`를 비교해 잘림을 감지할 수 있고,   
+필요하다면 `nr_children`을 기준으로 더 큰 버퍼를 할당한 뒤 다시 요청할 수 있습니다.
 
 ### 부모 PID 채우기
 
