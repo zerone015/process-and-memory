@@ -23,9 +23,9 @@
 
 #define PID_INFO_INPUT_SIZE  offsetof(struct pid_info, nr_children)
 
-static long task_children_count(struct task_struct *tsk)
+static int task_children_count(struct task_struct *tsk)
 {
-    long ret;
+    int ret;
 
     read_lock(&tasklist_lock);
     ret = list_count_nodes(&tsk->children);
