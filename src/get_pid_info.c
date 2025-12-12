@@ -68,6 +68,7 @@ static int fill_children(struct pid_info *info, struct task_struct *tsk)
     int nr, cap_elems, n;
 
     nr = task_children_count(tsk);
+	
     info->nr_children = nr;
 
     if (!nr)
