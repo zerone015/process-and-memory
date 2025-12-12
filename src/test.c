@@ -8,6 +8,7 @@
 #include "pid_info.h"
 
 #define __NR_get_pid_info 470
+#define CHILD_BUF_SIZE    128
 
 static const char *pid_state_to_string(int state)
 {
@@ -23,9 +24,31 @@ static const char *pid_state_to_string(int state)
     }
 }
 
-static long get_pid_info(int pid, struct pid_info *info)
+static long do_get_pid_info(int pid,
+                            struct pid_info *info,
+                            int *children_buf,
+                            int cap_children_bytes)
 {
+    memset(info, 0, sizeof(*info));
+    info->children     = children_buf;
+    info->cap_children = cap_children_bytes;
+
     return syscall(__NR_get_pid_info, info, pid);
+}
+
+static long get_pid_info_simple(int pid, struct pid_info *info)
+{
+    return do_get_pid_info(pid, info, NULL, 0);
+}
+
+static long get_pid_info_with_children(int pid,
+                                       struct pid_info *info,
+                                       int *children_buf,
+                                       int cap_children_elems)
+{
+    return do_get_pid_info(pid, info,
+                           children_buf,
+                           cap_children_elems * (int)sizeof(int));
 }
 
 static void format_age(char *buf, size_t sz, __u64 age_ns)
@@ -68,7 +91,7 @@ static void print_parent_chain(int ppid)
     }
 
     while (ppid > 0) {
-        if (get_pid_info(ppid, &info) < 0) {
+        if (get_pid_info_simple(ppid, &info) < 0) {
             fprintf(stderr, "get_pid_info(%d) failed: %s\n",
                     ppid, strerror(errno));
             exit(EXIT_FAILURE);
@@ -90,15 +113,18 @@ static void print_children(const struct pid_info *info)
 
     printf("\n=== Children of PID %d ===\n\n", info->pid);
 
-    if (info->num_children <= 0) {
+    if (info->nr_children <= 0) {
         printf("No children.\n\n");
         return;
     }
 
-    for (int i = 0; i < info->num_children; i++) {
+    printf("Total children : %d\n", info->nr_children);
+    printf("Reported       : %d\n", info->nr_reported);
+
+    for (int i = 0; i < info->nr_reported; i++) {
         int cpid = info->children[i];
 
-        if (get_pid_info(cpid, &child_info) < 0) {
+        if (get_pid_info_simple(cpid, &child_info) < 0) {
             fprintf(stderr, "get_pid_info(child=%d) failed: %s\n",
                     cpid, strerror(errno));
             exit(EXIT_FAILURE);
@@ -114,6 +140,7 @@ int main(int argc, char **argv)
 {
     int pid;
     struct pid_info info;
+    int children_buf[CHILD_BUF_SIZE];
 
     if (argc >= 2) {
         pid = atoi(argv[1]);
@@ -127,7 +154,9 @@ int main(int argc, char **argv)
 
     printf("Base PID = %d\n\n", pid);
 
-    if (get_pid_info(pid, &info) < 0) {
+    if (get_pid_info_with_children(pid, &info,
+                                   children_buf,
+                                   CHILD_BUF_SIZE) < 0) {
         fprintf(stderr, "get_pid_info(%d) failed: %s\n",
                 pid, strerror(errno));
         return EXIT_FAILURE;
@@ -139,4 +168,3 @@ int main(int argc, char **argv)
 
     return EXIT_SUCCESS;
 }
-

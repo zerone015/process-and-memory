@@ -5,8 +5,6 @@
 #include <linux/types.h>
 #include <linux/limits.h>
 
-#define MAX_CHILDREN 128
-
 enum pid_state {
 	PID_STATE_RUNNING = 0, 
 	PID_STATE_SLEEPING = 1,
@@ -14,12 +12,17 @@ enum pid_state {
 };
 
 struct pid_info {
+    /* input */
+    int *children;
+    int cap_children;
+
+    /* output */
+    int nr_children;
+    int nr_reported;
     int pid;
     int state;
     unsigned long sp;
     __u64 age;
-    int children[MAX_CHILDREN];
-    int num_children;
     int parent;
     char root[PATH_MAX];
     char pwd[PATH_MAX];

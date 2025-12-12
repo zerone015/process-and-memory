@@ -19,10 +19,75 @@
 #include <linux/compiler.h>
 #include <linux/fs_struct.h>
 #include <uapi/linux/pid_info.h>
+#include <linux/minmax.h>
 
-static void fill_pid(struct pid_info *info, int pid)
+#define PID_INFO_INPUT_SIZE  offsetof(struct pid_info, nr_children)
+
+static long task_children_count(struct task_struct *tsk)
 {
-    info->pid = pid;
+    long ret;
+
+    read_lock(&tasklist_lock);
+    ret = list_count_nodes(&tsk->children);
+    read_unlock(&tasklist_lock);
+    return ret;
+}
+
+static int copy_children(struct pid_info *info, struct task_struct *tsk, int n) 
+{
+    struct task_struct *child;
+    int *buf;
+    int i = 0;
+    int ret = 0;
+
+    buf = kvmalloc_array(n, sizeof(int), GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    read_lock(&tasklist_lock);
+    list_for_each_entry(child, &tsk->children, sibling) {
+        if (i == n)
+            break;
+        buf[i++] = child->pid;
+    }
+    read_unlock(&tasklist_lock);
+
+    if (copy_to_user(info->children, buf, i*sizeof(*buf))) {
+        ret = -EFAULT;
+        goto out;
+    }
+    info->nr_reported = i;
+
+out:
+    kvfree(buf);
+    return ret;
+}
+
+static int fill_children(struct pid_info *info, struct task_struct *tsk)
+{
+    int nr, cap_elems, n;
+
+    nr = task_children_count(tsk);
+    info->nr_children = nr;
+
+    if (!nr)
+        return 0;
+    
+    if (!info->children)
+        return 0;
+    
+    cap_elems = info->cap_children / sizeof(int);
+    if (cap_elems <= 0)
+        return 0;
+    
+    n = min_t(int, nr, cap_elems);
+
+    return copy_children(info, tsk, n);
+}
+
+static void fill_pid(struct pid_info *info, struct task_struct *tsk)
+{
+    info->pid = tsk->pid;
 }
 
 static void fill_state(struct pid_info *info, struct task_struct *tsk)
@@ -40,7 +105,6 @@ static void fill_sp(struct pid_info *info, struct task_struct *tsk)
     struct mm_struct *mm;
 
     mm = get_task_mm(tsk);
-
     if (!mm)
         return;
 
@@ -53,22 +117,6 @@ static void fill_age(struct pid_info *info, struct task_struct *tsk)
     u64 now = ktime_get_ns();
 
     info->age = now - tsk->start_time;
-}
-
-static void fill_children(struct pid_info *info, struct task_struct *tsk)
-{
-    struct task_struct *child;
-    int i = 0;
-
-    read_lock(&tasklist_lock);
-    list_for_each_entry(child, &tsk->children, sibling) {
-        if (i == MAX_CHILDREN)
-            break;
-        info->children[i++] = child->pid;
-    }
-    read_unlock(&tasklist_lock);
-
-    info->num_children = i;
 }
 
 static void fill_parent(struct pid_info *info, struct task_struct *tsk)
@@ -123,42 +171,57 @@ static void fill_root_and_pwd(struct pid_info *info, struct task_struct *tsk)
     path_put(&pwd);
 }
 
+static int fill_info(struct pid_info *info, struct task_struct *tsk, 
+                    struct pid_info __user *up)
+{
+    int ret;
+
+    if (copy_from_user(info, up, PID_INFO_INPUT_SIZE))
+        return -EFAULT;
+
+    ret = fill_children(info, tsk);
+    if (ret)
+        return ret;
+
+    fill_pid(info, tsk);
+    fill_state(info, tsk);
+    fill_sp(info, tsk);
+    fill_age(info, tsk);
+    fill_parent(info, tsk);
+    fill_root_and_pwd(info, tsk);
+
+    return 0;
+}
+
 SYSCALL_DEFINE2(get_pid_info, struct pid_info __user *, up, int, pid)
 {
     struct pid_info *info;
     struct task_struct *tsk;
     long ret = 0;
-
+    
     if (!up || pid <= 0)
         return -EINVAL;
 
-    info = kzalloc(sizeof(*info), GFP_KERNEL);
-
-    if (!info)
-		return -ENOMEM;
-
     tsk = find_get_task_by_vpid(pid);
-
-    if (!tsk) {
-        ret = -ESRCH;
+    if (!tsk)
+        return -ESRCH;
+        
+    info = kzalloc(sizeof(*info), GFP_KERNEL);
+    if (!info) {
+		ret = -ENOMEM;
         goto out;
     }
 
-    fill_pid(info, pid);
-    fill_state(info, tsk);
-    fill_sp(info, tsk);
-    fill_age(info, tsk);
-    fill_children(info, tsk);
-    fill_parent(info, tsk);
-    fill_root_and_pwd(info, tsk);
+    ret = fill_info(info, tsk, up);
+    if (ret)
+        goto out_cleanup_info; 
 
     if (copy_to_user(up, info, sizeof(*info)))
         ret = -EFAULT;
-
-    put_task_struct(tsk);
     
-out:
+out_cleanup_info:
     kfree(info);
-
+out:
+    put_task_struct(tsk);
     return ret;
 }
